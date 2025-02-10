@@ -188,6 +188,30 @@ function compute_local_descriptors(A::AbstractSystem, pod::LAMMPS_POD)
     final_ld
 end
 
+function compute_perelem_local_descriptors(A::AbstractSystem, pod::LAMMPS_POD)
+    lmp = pod.lmp
+    setup_lammps_system!(A,pod)
+    command(lmp, "run 0")
+
+    atomids = extract_atom(lmp, "id", LAMMPS_INT)
+    sort_idxs = sortperm(atomids)
+    @assert length(A) == length(atomids)
+
+    raw_ld = extract_compute(lmp,"ld", STYLE_ATOM,TYPE_ARRAY)'
+    raw_types = extract_atom(lmp,"type", LAMMPS_INT)
+    sorted_ld = raw_ld[sort_idxs,:]
+    sorted_types = raw_types[sort_idxs,:]
+
+    command(lmp, "pair_style none")
+    command(lmp, "pair_style    zero 10.0")
+    command(lmp, "pair_coeff    * * ")
+
+    sorted_ld
+end
+
+function compute_peratom_force_descriptors(A::AbstracSystem, pod::LAMMPS_POD)
+end
+
 function compute_force_descriptors(A::AbstractSystem, pod::LAMMPS_POD)
     lmp = pod.lmp
 
