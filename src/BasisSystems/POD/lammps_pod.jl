@@ -11,8 +11,8 @@ mutable struct LAMMPS_POD <: BasisSystem
     species_map::Vector{Symbol} # index corresponds to lammps type
     pod_spec::Union{POD,Nothing}
     num_perelem_ld::Int64
-    type_cache::Matrix{Int32} # extra logic for compute dd, this is the output type we receive 
-    c_dd_cache::Int64 # extra logic for compute dd
+    type_cache::Matrix{Int32} # extra logic for compute fd/fdd, this is the output type we receive
+    c_dd_cache::Int64 # extra logic for compute fd/fdd
     
     LAMMPS_POD(lmp,param_file,species_map,pod_spec,num_perelem_ld) = new(lmp,param_file,species_map,pod_spec,num_perelem_ld,Int32[-1;;],-1)
 end
@@ -209,16 +209,47 @@ function compute_perelem_local_descriptors(A::AbstractSystem, pod::LAMMPS_POD)
     sorted_ld
 end
 
-function compute_peratom_force_descriptors(A::AbstracSystem, pod::LAMMPS_POD)
-end
+#= Why is the following necessary?
+The output of podd/atom depends on the number and types of atoms in the system, so if that changes, this compute needs to change.
+(When the compute is defined, it looks at the current atom list to figure out it's output)
+Unfortunately, uncompute'ing a compute id does not free it up, and that compute id cannot be reused, hence this extra logic
 
-function compute_force_descriptors(A::AbstractSystem, pod::LAMMPS_POD)
-    lmp = pod.lmp
+For standard MD simulations, there should only be one of these podd/atom computes (unless the simulation can have variable numbers of atoms).
 
+However, using a single LAMMPS_POD instance for computing descriptors of a training set may result in many of these computes.
+In the worst case scenario, for randomized diverse training sets, every time the next configuration has different #/types of atoms, a new compute is added.
+stochastic batch methods may be particularly problematic (at least if descriptors aren't cached).
+
+I'm not sure if there's any huge consequence for having many computes in terms of lammps performance (or if there are a maximum number of computes).
+Testing is needed
+=#
+function _update_pod_computes!(sorted_types::Array{Int32}, pod::LAMMPS_POD, lmp)
     atomtype_str = ""
     for elem_symbol in pod.species_map 
         atomtype_str = atomtype_str * " " * string(elem_symbol)
     end
+
+
+    if sorted_types != pod.type_cache
+        pod.type_cache = sorted_types # this should be OK because sorted_type is a copy of the lammps types array
+        if pod.c_dd_cache == -1
+            pod.c_dd_cache = 0
+            command(lmp, """compute fd$(pod.c_dd_cache) all pod/global $(pod.param_file) "" $(atomtype_str)""")
+            command(lmp, """compute fdd$(pod.c_dd_cache) all podd/atom $(pod.param_file) "" $(atomtype_str)""")
+
+        else
+            command(lmp, "uncompute fd$(pod.c_dd_cache)")
+            command(lmp, "uncompute fdd$(pod.c_dd_cache)")
+
+            pod.c_dd_cache += 1
+            command(lmp, """compute fd$(pod.c_dd_cache) all pod/global $(pod.param_file) "" $(atomtype_str)""")
+            command(lmp, """compute fdd$(pod.c_dd_cache) all podd/atom $(pod.param_file) "" $(atomtype_str)""")
+        end
+    end
+end
+
+function compute_peratom_force_descriptors_withindices(A::AbstractSystem, pod::LAMMPS_POD)
+    lmp = pod.lmp
 
     setup_lammps_system!(A,pod)
     num_atoms = length(A)::Int64
@@ -230,17 +261,7 @@ function compute_force_descriptors(A::AbstractSystem, pod::LAMMPS_POD)
     raw_types = extract_atom(lmp,"type", LAMMPS_INT)::Vector{Int32}
     sorted_types = raw_types[sort_idxs,:]::Array{Int32} # is it Array because I'm slicing it?
 
-    if sorted_types != pod.type_cache
-        pod.type_cache = sorted_types # this should be OK because sorted_type is a copy of the lammps types array
-        if pod.c_dd_cache == -1
-            pod.c_dd_cache = 0
-            command(lmp, """compute dd$(pod.c_dd_cache) all pod/global $(pod.param_file) "" $(atomtype_str)""")
-        else 
-            command(lmp, "uncompute dd$(pod.c_dd_cache)")
-            pod.c_dd_cache += 1
-            command(lmp, """compute dd$(pod.c_dd_cache) all pod/global $(pod.param_file) "" $(atomtype_str)""")
-        end
-    end
+    _update_pod_computes!(sorted_types, pod, lmp)
 
     command(lmp, "run 0")
 
@@ -248,7 +269,60 @@ function compute_force_descriptors(A::AbstractSystem, pod::LAMMPS_POD)
     num_perelem_ld = pod.num_perelem_ld::Int64
     total_num_ld = num_pod_types*(num_perelem_ld)
 
-    raw_dd = extract_compute(lmp, "dd$(pod.c_dd_cache)", STYLE_GLOBAL, TYPE_ARRAY)::Array{Float64,2}
+    raw_dd = extract_compute(lmp, "fdd$(pod.c_dd_cache)", STYLE_ATOM, TYPE_ARRAY)::Array{Float64,2}
+    #raw_dd = raw_dd'
+
+    peratom_dd = permutedims(reshape(raw_dd, :, 3*num_atoms, num_atoms), (2,3,1))
+
+    # account for one-body term that is absent in raw_dd (NOT NEEDED ANYMORE)
+    # peratom_dd = cat(zeros(3*num_atoms,num_atoms,1), final_peratom_dd, dims=3)
+
+    final_peratom_dd = zeros(3*num_atoms, num_atoms, total_num_ld)
+    indices = UnitRange{Int64}[]
+    for i in 1:num_atoms
+        itype  = sorted_types[i]
+        fstart = (itype-1)*num_perelem_ld+2 # 1-indexing, skipping 1-body
+        fend   = fstart + (num_perelem_ld-1) -1
+        push!(indices, fstart-1:fend)
+
+        final_peratom_dd[:,i, fstart:fend] += peratom_dd[:,i,:]
+     end
+
+    command(lmp, "pair_style none")
+    command(lmp, "pair_style    zero 10.0")
+    command(lmp, "pair_coeff    * * ")
+
+    final_peratom_dd, indices
+end
+
+function compute_peratom_force_descriptors(A::AbstractSystem, pod::LAMMPS_POD)
+    final_peratom_dd, indices = compute_peratom_force_descriptors_withindices(A,pod)
+    final_peratom_dd
+end
+
+
+function compute_force_descriptors(A::AbstractSystem, pod::LAMMPS_POD)
+    lmp = pod.lmp
+
+    setup_lammps_system!(A,pod)
+    num_atoms = length(A)::Int64
+    atomids = extract_atom(lmp, "id", LAMMPS_INT)
+    @assert num_atoms == length(atomids)
+
+    sort_idxs = sortperm(atomids)::Vector{Int64}
+    @assert sort_idxs == [Int64(i) for i in 1:num_atoms] #so we can use raw_dd
+    raw_types = extract_atom(lmp,"type", LAMMPS_INT)::Vector{Int32}
+    sorted_types = raw_types[sort_idxs,:]::Array{Int32} # is it Array because I'm slicing it?
+
+    _update_pod_computes!(sorted_types, pod, lmp)
+
+    command(lmp, "run 0")
+
+    num_pod_types = length(pod.species_map)::Int64
+    num_perelem_ld = pod.num_perelem_ld::Int64
+    total_num_ld = num_pod_types*(num_perelem_ld)
+
+    raw_dd = extract_compute(lmp, "fd$(pod.c_dd_cache)", STYLE_GLOBAL, TYPE_ARRAY)::Array{Float64,2}
     raw_dd = raw_dd'
 
     final_dd = [[raw_dd[3*i+k+1,1:end] for k in 1:3] for i in 0:num_atoms-1]
